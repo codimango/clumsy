@@ -11,6 +11,18 @@ static volatile short dropEnabled = 0,
     dropInbound = 1, dropOutbound = 1,
     chance = 1000; // [0-10000]
 
+// ---- sliding-window byte-rate limiter -------------------------------------
+// Configured via the environment at start up:
+//   CLUMSY_RL_WINDOW    : W (>0) window size
+//   CLUMSY_RL_MAX_BYTES : B (>0) max admitted bytes allowed within a window
+static int rlWindow = 0;
+static long long rlMaxBytes = 0;
+static short rlActive = 0;
+static long long *rlSlots = NULL;
+static int rlPos = 0;
+static int rlCount = 0;
+static long long rlWindowSum = 0;
+
 
 static Ihandle* dropSetupUI() {
     Ihandle *dropControlsBox = IupHbox(
@@ -43,13 +55,40 @@ static Ihandle* dropSetupUI() {
     return dropControlsBox;
 }
 
+static void dropResetRL() {
+    rlWindow = 0;
+    rlMaxBytes = 0;
+    rlActive = 0;
+    free(rlSlots);
+    rlSlots = NULL;
+    rlPos = 0;
+    rlCount = 0;
+    rlWindowSum = 0;
+}
+
 static void dropStartUp() {
+    const char *w = getenv("CLUMSY_RL_WINDOW");
+    const char *b = getenv("CLUMSY_RL_MAX_BYTES");
+    dropResetRL();
+    if (w && b) {
+        int win = atoi(w);
+        long long maxb = atoll(b);
+        if (win > 0 && maxb > 0) {
+            rlSlots = (long long*)calloc((size_t)win, sizeof(long long));
+            if (rlSlots) {
+                rlWindow = win;
+                rlMaxBytes = maxb;
+                rlActive = 1;
+            }
+        }
+    }
     LOG("drop enabled");
 }
 
 static void dropCloseDown(PacketNode *head, PacketNode *tail) {
     UNREFERENCED_PARAMETER(head);
     UNREFERENCED_PARAMETER(tail);
+    dropResetRL();
     LOG("drop disabled");
 }
 
@@ -64,6 +103,22 @@ static short dropProcess(PacketNode *head, PacketNode* tail) {
                 chance/100.0, pac->addr.Outbound ? "OUTBOUND" : "INBOUND");
             freeNode(popNode(pac));
             ++dropped;
+        } else if (rlActive) {
+            // the existing logic would forward pac; the rate limiter decides.
+            long long contrib = (long long)pac->packetLen;
+            long long evicted = (rlCount == rlWindow) ? rlSlots[(rlPos + 1) % rlWindow] : 0;
+            long long windowBase = rlWindowSum - evicted;
+            short admit = (windowBase + contrib <= rlMaxBytes);
+            if (admit) {
+                rlSlots[rlPos] = contrib;
+                rlWindowSum = windowBase + contrib;
+                rlPos = (rlPos + 1) % rlWindow;
+                if (rlCount < rlWindow) ++rlCount;
+                head = head->next;
+            } else {
+                freeNode(popNode(pac));
+                ++dropped;
+            }
         } else {
             head = head->next;
         }
